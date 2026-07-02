@@ -14,8 +14,25 @@
 # ==============================================================================
 
 # --- Configuration ---
-LOG_FILE="/var/log/system_cleaner.log"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOG_FILE="$HOME/Library/Logs/system_cleaner.log"
+else
+    LOG_FILE="/var/log/system_cleaner.log"
+fi
 DATE=$(date +%Y-%m-%d_%H-%M-%S)
+
+# Resolve invoking user home and execution prefix when elevated with sudo
+USER_HOME="$HOME"
+RUN_USER=""
+if [[ -n "$SUDO_USER" ]]; then
+    RUN_USER="sudo -u $SUDO_USER"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        USER_HOME=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    else
+        USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    fi
+    [[ -z "$USER_HOME" ]] && USER_HOME="$HOME"
+fi
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -79,22 +96,38 @@ capture_updates_zypper() {
 }
 
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-       echo -e "${RED}[ERROR] This script must be run as root.${NC}"
-       echo "[$DATE] [ERROR] Script run without root privileges." >> "$LOG_FILE"
-       exit 1
+    if [[ "$DISTRO" == "macos" ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            echo -e "${YELLOW}[WARNING] Running as root/sudo on macOS is not recommended.${NC}"
+            echo -e "The script will dynamically drop privileges to $SUDO_USER for user-level tasks."
+            echo "[$DATE] [WARNING] Script run as root on macOS. Invoking user: $SUDO_USER" >> "$LOG_FILE"
+        fi
+    else
+        if [[ $EUID -ne 0 ]]; then
+           echo -e "${RED}[ERROR] This script must be run as root.${NC}"
+           echo "[$DATE] [ERROR] Script run without root privileges." >> "$LOG_FILE"
+           exit 1
+        fi
     fi
 }
 
 detect_distro() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        DISTRO=$ID
+    OS_TYPE=$(uname -s)
+    if [[ "$OS_TYPE" == "Darwin" ]]; then
+        DISTRO="macos"
+    elif [[ "$OS_TYPE" == "Linux" ]]; then
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            DISTRO=$ID
+        else
+            echo -e "${RED}[ERROR] Cannot detect Linux distribution.${NC}"
+            exit 1
+        fi
     else
-        echo -e "${RED}[ERROR] Cannot detect Linux distribution.${NC}"
+        echo -e "${RED}[ERROR] Unsupported Operating System: $OS_TYPE${NC}"
         exit 1
     fi
-    log "Detected distribution: $DISTRO"
+    log "Detected Operating System/Distro: $DISTRO"
 }
 
 task_deep_clean() {
@@ -124,18 +157,39 @@ task_deep_clean() {
 # --- Progress Bar & UI ---
 
 calculate_total_steps() {
-    # Base steps for update/clean (Update repo, Upgrade Pkg, Dist Upgrade, Clean, Autoremove)
-    TOTAL_STEPS=5
+    TOTAL_STEPS=0
     
-    # Dynamic checks
-    command -v snap >/dev/null 2>&1 && ((TOTAL_STEPS++))
-    command -v flatpak >/dev/null 2>&1 && ((TOTAL_STEPS++))
-    command -v docker >/dev/null 2>&1 && ((TOTAL_STEPS+=2)) # Prune system & builder
+    if [[ "$DISTRO" == "macos" ]]; then
+        # Core macOS steps:
+        # 1. User Caches
+        # 2. User Logs
+        # 3. Trash
+        # 4. System Logs
+        # 5. System Temp Files
+        # 6. DNS Cache Flush
+        TOTAL_STEPS=6
+        
+        command -v brew >/dev/null 2>&1 && ((TOTAL_STEPS+=3))
+        command -v mas >/dev/null 2>&1 && ((TOTAL_STEPS++))
+        [ -d "$HOME/Library/Developer/Xcode" ] && ((TOTAL_STEPS+=2))
+    else
+        # Base steps for Linux update/clean:
+        # 1. Update repo, 2. Upgrade Pkg, 3. Dist Upgrade, 4. Clean, 5. Autoremove
+        TOTAL_STEPS=5
+        
+        # Generic Linux steps:
+        # 1. Temp, 2. Old logs, 3. Deep Clean
+        ((TOTAL_STEPS+=3))
+        
+        command -v journalctl >/dev/null 2>&1 && ((TOTAL_STEPS++))
+        command -v snap >/dev/null 2>&1 && ((TOTAL_STEPS++))
+        command -v flatpak >/dev/null 2>&1 && ((TOTAL_STEPS++))
+    fi
+    
+    # Common tools
+    command -v docker >/dev/null 2>&1 && ((TOTAL_STEPS+=2))
     command -v npm >/dev/null 2>&1 && ((TOTAL_STEPS++))
     command -v pip3 >/dev/null 2>&1 && ((TOTAL_STEPS++))
-    
-    # Generic steps (Journal vacuum, Temp, old logs)
-    ((TOTAL_STEPS+=3))
 }
 
 draw_progress_bar() {
@@ -151,15 +205,15 @@ draw_progress_bar() {
     printf "\r"
     printf "${BLUE}[${NC}"
     
-    # Filled part
-    if [ $filled -gt 0 ]; then
-        printf "%0.s#" $(seq 1 $filled)
-    fi
+    # Filled part (pure bash loop for portability)
+    local filled_chars=""
+    for ((i=0; i<filled; i++)); do filled_chars="${filled_chars}#"; done
+    printf "%s" "$filled_chars"
     
-    # Empty part
-    if [ $empty -gt 0 ]; then
-        printf "%0.s." $(seq 1 $empty)
-    fi
+    # Empty part (pure bash loop for portability)
+    local empty_chars=""
+    for ((i=0; i<empty; i++)); do empty_chars="${empty_chars}."; done
+    printf "%s" "$empty_chars"
     
     printf "${BLUE}]${NC} ${percent}%% - ${CYAN}${description}${NC}"
     
@@ -241,6 +295,33 @@ task_zypper() {
     run_task "Verifying dependencies" "zypper verify"
 }
 
+# MACOS
+task_macos() {
+    if command -v brew >/dev/null 2>&1; then
+        run_task "Updating Homebrew formulae" "$RUN_USER brew update"
+        run_task "Upgrading Homebrew packages" "$RUN_USER brew upgrade"
+        run_task "Cleaning up Homebrew cache & old versions" "$RUN_USER brew cleanup -s"
+    fi
+    
+    if command -v mas >/dev/null 2>&1; then
+        run_task "Upgrading Mac App Store apps" "$RUN_USER mas upgrade"
+    fi
+    
+    if [ -d "$USER_HOME/Library/Developer/Xcode" ]; then
+        run_task "Cleaning Xcode DerivedData" "$RUN_USER rm -rf \"$USER_HOME/Library/Developer/Xcode/DerivedData/\"*"
+        run_task "Cleaning Xcode Archives" "$RUN_USER rm -rf \"$USER_HOME/Library/Developer/Xcode/Archives/\"*"
+    fi
+    
+    run_task "Cleaning User Cache (~/Library/Caches)" "$RUN_USER rm -rf \"$USER_HOME/Library/Caches/\"* 2>/dev/null || true"
+    run_task "Cleaning User Logs (~/Library/Logs)" "$RUN_USER rm -rf \"$USER_HOME/Library/Logs/\"* 2>/dev/null || true"
+    run_task "Emptying Trash (~/.Trash)" "$RUN_USER rm -rf \"$USER_HOME/.Trash/\"* 2>/dev/null || true"
+    
+    run_task "Cleaning System Logs (/Library/Logs & /var/log)" "sudo rm -rf /Library/Logs/* /var/log/*.log /var/log/asl/* 2>/dev/null || true"
+    run_task "Cleaning System Temp files (/tmp & /var/tmp)" "sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null || true"
+    
+    run_task "Flushing DNS Cache" "sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
+}
+
 # --- Extended Update & Cleaning ---
 
 run_extended_tasks() {
@@ -270,43 +351,45 @@ run_extended_tasks() {
 
     # NODE.JS
     if command -v npm >/dev/null 2>&1; then
-        run_task "Cleaning NPM cache" "npm cache clean --force"
+        run_task "Cleaning NPM cache" "$RUN_USER npm cache clean --force"
     fi
 
     # PYTHON
     if command -v pip3 >/dev/null 2>&1; then
-        run_task "Cleaning PIP cache" "pip3 cache purge"
+        run_task "Cleaning PIP cache" "$RUN_USER pip3 cache purge"
     fi
     
-    # GENERIC SYSTEM CLEANUP
-    # 1. Journal
-    if command -v journalctl >/dev/null 2>&1; then
-        run_task "Vacuuming systemd journals (keep 2 weeks)" "journalctl --vacuum-time=2weeks"
-    else 
-        # Skip if not found to balance step count
-        ((CURRENT_STEP++))
-    fi
-    
-    # 2. Temp files
-    run_task "Cleaning temporary files" "rm -rf /var/tmp/*"
+    # GENERIC SYSTEM CLEANUP (Linux only)
+    if [[ "$DISTRO" != "macos" ]]; then
+        # 1. Journal
+        if command -v journalctl >/dev/null 2>&1; then
+            run_task "Vacuuming systemd journals (keep 2 weeks)" "journalctl --vacuum-time=2weeks"
+        else 
+            # Skip if not found to balance step count
+            ((CURRENT_STEP++))
+        fi
+        
+        # 2. Temp files
+        run_task "Cleaning temporary files" "rm -rf /var/tmp/*"
 
-    # 3. Old Logs
-    run_task "Cleaning old compressed logs" "find /var/log -type f -name '*.gz' -delete -o -name '*.1' -delete"
+        # 3. Old Logs
+        run_task "Cleaning old compressed logs" "find /var/log -type f -name '*.gz' -delete -o -name '*.1' -delete"
 
-    # 4. Deep Clean
-    if [ -f /usr/bin/dpkg ] || [ -f /bin/rpm ]; then
-         task_deep_clean
-    else
-         # Generic deep clean fallback
-         shopt -s nullglob
-         for user_home in /home/* /root; do
-            if [ -d "$user_home" ]; then
-                [ -d "$user_home/.cache/thumbnails" ] && rm -rf "$user_home/.cache/thumbnails"/* 2>/dev/null
-                [ -d "$user_home/.local/share/Trash" ] && rm -rf "$user_home/.local/share/Trash"/* 2>/dev/null
-            fi
-        done
-        shopt -u nullglob
-        run_task "Deep cleaning: User Thumbnails & Trash" "true"
+        # 4. Deep Clean
+        if [ -f /usr/bin/dpkg ] || [ -f /bin/rpm ]; then
+             task_deep_clean
+        else
+             # Generic deep clean fallback
+             shopt -s nullglob
+             for user_home in /home/* /root; do
+                if [ -d "$user_home" ]; then
+                    [ -d "$user_home/.cache/thumbnails" ] && rm -rf "$user_home/.cache/thumbnails"/* 2>/dev/null
+                    [ -d "$user_home/.local/share/Trash" ] && rm -rf "$user_home/.local/share/Trash"/* 2>/dev/null
+                fi
+            done
+            shopt -u nullglob
+            run_task "Deep cleaning: User Thumbnails & Trash" "true"
+        fi
     fi
 }
 
@@ -317,7 +400,7 @@ print_banner() {
     echo -e "${BLUE}"
     cat << "EOF"
 			
-_̣_______________    __                         
+________________    __                         
  __ _____  ____/___  /__________ ____________________
   ____ __  / _____  /_  _ \  __ `/_  __ \  _ \_  ___/
    ___  / /___  _  / /  __/ /_/ /_  / / /  __/  /    
@@ -325,10 +408,10 @@ _̣_______________    __
                                              
 EOF
     echo -e "${NC}"
-    echo -e "${BLUE}   Universal Linux Cleaner & Updater     ${NC}"
+    echo -e "${BLUE}   Universal System Cleaner & Updater     ${NC}"
     echo -e "${YELLOW}   Version: 2.0.0 (Pro)                  ${NC}"
-    echo -e "${YELLOW}   Author: GabxSup  - https://github.com/GabxSup
-    License: MIT  ${NC}"
+    echo -e "${YELLOW}   Author: GabxSup  - https://github.com/GabxSup${NC}"
+    echo -e "${YELLOW}   License: MIT                          ${NC}"
     echo -e "${BLUE}=========================================${NC}"
     echo "Logs saved to: $LOG_FILE"
     echo ""
@@ -363,8 +446,8 @@ print_summary() {
 }
 
 main() {
-    check_root
     detect_distro
+    check_root
     calculate_total_steps
     
     print_banner
@@ -394,6 +477,9 @@ main() {
             ;;
         opensuse*|sles)
             task_zypper
+            ;;
+        macos)
+            task_macos
             ;;
         *)
             echo -e "${RED}[ERROR] Distribution '$DISTRO' is not fully supported.${NC}"
