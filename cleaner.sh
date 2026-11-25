@@ -992,6 +992,10 @@ main() {
         printf 'Error: virtual environment scan path is not a directory: %s\n' "$SCAN_VENV_PATH" >&2
         exit 1
     fi
+    if [[ -n "$SCAN_VENV_PATH" && ( ! -r "$SCAN_VENV_PATH" || ! -x "$SCAN_VENV_PATH" ) ]]; then
+        printf 'Error: virtual environment scan path is not accessible: %s\n' "$SCAN_VENV_PATH" >&2
+        exit 1
+    fi
     detect_distro
     setup_privileges
 
