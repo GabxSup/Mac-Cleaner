@@ -318,15 +318,29 @@ draw_progress_bar() {
 run_clean_path() {
     local description="$1"
     local clean_mode="$2"   # "contents" (delete files inside) or "dir" (delete directory itself)
-    local target_paths="$3" # Space-separated paths
+    local target_paths="$3" # Newline-separated paths
     local custom_rm_cmd="$4"
+    local -a path_list=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        case "$p" in
+            *'*'*|*'?'*|*'['*)
+                while IFS= read -r matched_path; do
+                    path_list+=("$matched_path")
+                done < <(compgen -G "$p")
+                ;;
+            *)
+                path_list+=("$p")
+                ;;
+        esac
+    done <<< "$target_paths"
 
     ((CURRENT_STEP++))
     draw_progress_bar "$description..."
     log "STARTING CLEAN: $description"
 
     local freed_kb=0
-    for p in $target_paths; do
+    for p in "${path_list[@]}"; do
         if [[ -e "$p" ]]; then
             local sz
             sz=$(measure_path_kb "$p")
@@ -351,7 +365,7 @@ run_clean_path() {
             success=false
         fi
     else
-        for p in $target_paths; do
+        for p in "${path_list[@]}"; do
             if [[ "$clean_mode" == "contents" && -d "$p" ]]; then
                 find "$p" -mindepth 1 -delete 2>> "$LOG_FILE" || rm -rf "${p:?}"/* 2>> "$LOG_FILE" || true
             elif [[ "$clean_mode" == "dir" && -e "$p" ]]; then
@@ -668,8 +682,8 @@ task_macos() {
         run_cmd_task "Resetting QuickLook Cache" "qlmanage -r cache"
 
         if [[ "$HAS_SUDO" == true ]]; then
-            run_clean_path "Cleaning System Logs (/Library/Logs & /var/log)" "contents" "/Library/Logs /var/log/asl" "sudo rm -rf /Library/Logs/* /var/log/*.log /var/log/asl/* 2>/dev/null || true"
-            run_clean_path "Cleaning System Temp files (/tmp & /var/tmp)" "contents" "/tmp /var/tmp" "sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null || true"
+            run_clean_path "Cleaning System Logs (/Library/Logs & /var/log)" "contents" $'/Library/Logs\n/var/log/asl' "sudo rm -rf /Library/Logs/* /var/log/*.log /var/log/asl/* 2>/dev/null || true"
+            run_clean_path "Cleaning System Temp files (/tmp & /var/tmp)" "contents" $'/tmp\n/var/tmp' "sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null || true"
             run_cmd_task "Flushing macOS DNS Cache" "sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
             run_cmd_task "Purging Inactive Memory" "sudo purge"
         fi
@@ -779,7 +793,9 @@ task_linux_system_clean() {
     done
     shopt -u nullglob
     if [ ${#user_caches[@]} -gt 0 ]; then
-        run_clean_path "Cleaning User Thumbnails & Trash" "contents" "${user_caches[*]}"
+        local user_cache_paths
+        printf -v user_cache_paths '%s\n' "${user_caches[@]}"
+        run_clean_path "Cleaning User Thumbnails & Trash" "contents" "$user_cache_paths"
     fi
 }
 
@@ -844,7 +860,7 @@ run_dev_tools_cleanup() {
 
     # 4. Rust / Cargo
     if command -v cargo >/dev/null 2>&1 || [ -d "$USER_HOME/.cargo/registry/cache" ]; then
-        run_clean_path "Cleaning Cargo registry & git cache" "contents" "$USER_HOME/.cargo/registry/cache $USER_HOME/.cargo/git/checkouts"
+        run_clean_path "Cleaning Cargo registry & git cache" "contents" "$USER_HOME/.cargo/registry/cache"$'\n'"$USER_HOME/.cargo/git/checkouts"
     fi
 
     # 5. Go
@@ -857,7 +873,7 @@ run_dev_tools_cleanup() {
         run_clean_path "Cleaning Gradle caches" "contents" "$USER_HOME/.gradle/caches"
     fi
     if [ -d "$USER_HOME/.android/cache" ] || [ -d "$USER_HOME/.android/build-cache" ]; then
-        run_clean_path "Cleaning Android SDK build cache" "contents" "$USER_HOME/.android/cache $USER_HOME/.android/build-cache"
+        run_clean_path "Cleaning Android SDK build cache" "contents" "$USER_HOME/.android/cache"$'\n'"$USER_HOME/.android/build-cache"
     fi
 
     # 7. PHP Composer
@@ -885,7 +901,7 @@ run_dev_tools_cleanup() {
 
     # 10. AI / Machine Learning Caches
     if [ -d "$USER_HOME/.cache/huggingface" ] || [ -d "$USER_HOME/.cache/torch" ]; then
-        run_clean_path "Cleaning AI/ML temporary downloads & lock files" "contents" "$USER_HOME/.cache/huggingface/hub/tmp* $USER_HOME/.cache/torch"
+        run_clean_path "Cleaning AI/ML temporary downloads & lock files" "contents" "$USER_HOME/.cache/huggingface/hub/tmp*"$'\n'"$USER_HOME/.cache/torch"
     fi
 }
 
