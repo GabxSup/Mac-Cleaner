@@ -367,9 +367,11 @@ run_clean_path() {
     else
         for p in "${path_list[@]}"; do
             if [[ "$clean_mode" == "contents" && -d "$p" ]]; then
-                find "$p" -mindepth 1 -delete 2>> "$LOG_FILE" || rm -rf "${p:?}"/* 2>> "$LOG_FILE" || true
+                if ! find "$p" -mindepth 1 -delete 2>> "$LOG_FILE"; then
+                    rm -rf "${p:?}"/* 2>> "$LOG_FILE" || success=false
+                fi
             elif [[ "$clean_mode" == "dir" && -e "$p" ]]; then
-                rm -rf "${p:?}" 2>> "$LOG_FILE" || true
+                rm -rf "${p:?}" 2>> "$LOG_FILE" || success=false
             fi
         done
     fi
