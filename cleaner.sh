@@ -659,14 +659,27 @@ task_scan_broken_venvs() {
 
     if [[ "$should_delete" == true ]]; then
         local deleted_count=0
-        for dir in "${broken_venvs[@]}"; do
+        local deleted_kb=0
+        local failed_count=0
+        local i dir
+        for i in "${!broken_venvs[@]}"; do
+            dir="${broken_venvs[$i]}"
             if rm -rf "$dir" 2>> "$LOG_FILE"; then
                 ((deleted_count++))
+                ((deleted_kb += broken_sizes[$i]))
                 log "Deleted broken virtual environment: $dir"
+            else
+                ((failed_count++))
+                log_error "Failed to delete broken virtual environment: $dir"
+                ERRORS_LOG+=("Failed to delete broken virtual environment: $dir")
             fi
         done
-        ((TOTAL_FREED_KB += total_broken_sz))
-        SUMMARY_LOG+=("${GREEN}✔${NC} Removed $deleted_count broken virtual environment(s) (Freed: ${CYAN}$(format_kb $total_broken_sz)${NC})")
+        ((TOTAL_FREED_KB += deleted_kb))
+        if [[ "$failed_count" -eq 0 ]]; then
+            SUMMARY_LOG+=("${GREEN}✔${NC} Removed $deleted_count broken virtual environment(s) (Freed: ${CYAN}$(format_kb $deleted_kb)${NC})")
+        else
+            SUMMARY_LOG+=("${YELLOW}⚠${NC} Removed $deleted_count of ${#broken_venvs[@]} broken virtual environment(s); $failed_count failed (Freed: ${CYAN}$(format_kb $deleted_kb)${NC})")
+        fi
     else
         SUMMARY_LOG+=("${YELLOW}⚠${NC} Skipped removal of ${#broken_venvs[@]} broken virtual environment(s)")
     fi
